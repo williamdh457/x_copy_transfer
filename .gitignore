@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node / Build / Packaging
+node_modules/
+dist/
+build/
+*.zip
+*.crx
+*.pem
+*.key
+
+# Logs & Environment
+*.log
+npm-debug.log*
+.env
+.env.*

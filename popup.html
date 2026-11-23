@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>X Article Markdown Paste</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="header">
+      <div class="title-row">
+        <h1 class="title">X Article Markdown Paste</h1>
+        <button id="lang-btn" class="lang-btn" type="button">English</button>
+      </div>
+      <p id="subtitle" class="subtitle"></p>
+    </header>
+
+    <div id="status-banner" class="banner banner-warn">
+      <span class="banner-icon">!</span>
+      <span id="status-text" class="banner-text"></span>
+      <a id="status-action" class="banner-link" href="#"></a>
+    </div>
+
+    <section class="card">
+      <h2 id="settings-title" class="card-title"></h2>
+
+      <div class="field">
+        <div class="field-row">
+          <label id="cover-label" for="cover-mode" class="field-label"></label>
+          <select id="cover-mode" class="select">
+            <option value="ask"></option>
+            <option value="first"></option>
+            <option value="none"></option>
+          </select>
+        </div>
+        <p id="cover-hint" class="field-hint"></p>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="field">
+        <div class="field-row">
+          <label id="table-label" for="table-mode" class="field-label"></label>
+          <select id="table-mode" class="select">
+            <option value="image"></option>
+            <option value="native"></option>
+          </select>
+        </div>
+        <p id="table-hint" class="field-hint"></p>
+      </div>
+    </section>
+
+    <section id="quick-import-card" class="card" hidden>
+      <input id="md-file-input" type="file" accept=".md,.markdown,.mdown,.mkd,.txt,text/markdown,text/plain" hidden />
+      <button id="quick-import-btn" class="primary-btn" type="button"></button>
+      <p id="quick-import-hint" class="field-hint center"></p>
+    </section>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
