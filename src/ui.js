@@ -20,6 +20,7 @@
       color: #0f1419;
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     .card {
       background: #ffffff;
       color: #0f1419;
@@ -50,6 +51,7 @@
     .btn-ghost { background: #eff3f4; color: #0f1419; }
     .btn-ghost:hover { background: #e1e8ed; }
     .btn-sm { padding: 4px 10px; font-size: 12px; }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
   `;
 
   function createShadowHost(id) {
@@ -221,6 +223,333 @@
     removeHost("hud");
   }
 
+  // --- DataTransfer Recursive File Reader ---
+  function readAllDirectoryEntries(dirEntry) {
+    return new Promise((resolve) => {
+      const reader = dirEntry.createReader();
+      const all = [];
+      const readNext = () => {
+        reader.readEntries(
+          (batch) => {
+            if (!batch || !batch.length) {
+              resolve(all);
+              return;
+            }
+            all.push(...batch);
+            readNext();
+          },
+          () => resolve(all)
+        );
+      };
+      readNext();
+    });
+  }
+
+  async function traverseEntry(entry, out) {
+    if (!entry) return;
+    if (entry.isFile) {
+      await new Promise((resolve) => {
+        entry.file(
+          (file) => {
+            const relPath = String(entry.fullPath || file.name || "").replace(/^\/+/, "");
+            out.push({ file, relPath });
+            resolve();
+          },
+          () => resolve()
+        );
+      });
+      return;
+    }
+    if (entry.isDirectory) {
+      const children = await readAllDirectoryEntries(entry);
+      for (const child of children) {
+        await traverseEntry(child, out);
+      }
+    }
+  }
+
+  async function collectFilesFromDataTransfer(dataTransfer, preCapturedEntries = null) {
+    if (!dataTransfer && !preCapturedEntries?.length) return [];
+    // Synchronously capture FileSystemEntry objects before any await
+    const entries = Array.isArray(preCapturedEntries) ? preCapturedEntries : [];
+    if (!entries.length && dataTransfer?.items) {
+      for (const item of Array.from(dataTransfer.items)) {
+        if (item.kind !== "file") continue;
+        const entry = item.webkitGetAsEntry?.();
+        if (entry) entries.push(entry);
+      }
+    }
+    if (entries.length) {
+      const out = [];
+      for (const entry of entries) {
+        await traverseEntry(entry, out);
+      }
+      return out;
+    }
+    return Array.from(dataTransfer?.files || []).map((file) => ({
+      file,
+      relPath: file.webkitRelativePath || file.name,
+    }));
+  }
+
+  // --- Local Assets Picker Modal ---
+  function promptLocalAssets(missingSources, onEntriesAdded) {
+    return new Promise((resolve) => {
+      const sources = Array.from(missingSources || []);
+      const { shadow } = createShadowHost("local_assets_modal");
+      const extraStyle = document.createElement("style");
+      extraStyle.textContent = `
+        .backdrop {
+          position: fixed;
+          inset: 0;
+          z-index: 2147483647;
+          background: rgba(15, 20, 25, 0.52);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 16px;
+        }
+        .modal {
+          width: 100%;
+          max-width: 460px;
+          max-height: 86vh;
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+          padding: 18px 20px;
+        }
+        .drop {
+          border: 1.5px dashed #cfd9de;
+          border-radius: 12px;
+          padding: 16px;
+          text-align: center;
+          cursor: pointer;
+          transition: border-color 0.15s, background 0.15s;
+        }
+        .drop:hover, .drop[data-over="true"] {
+          border-color: #1d9bf0;
+          background: rgba(29, 155, 240, 0.06);
+        }
+        .drop-title { font-weight: 600; font-size: 13px; margin: 0 0 4px; }
+        .sub-actions {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+        }
+        .link-btn {
+          background: none;
+          border: none;
+          padding: 0;
+          color: #1d9bf0;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .link-btn:hover { text-decoration: underline; }
+        .status {
+          font-size: 12px;
+          font-weight: 600;
+          color: #536471;
+        }
+        .status.ok { color: #007a5a; }
+        .local-list {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          max-height: 160px;
+          overflow-y: auto;
+        }
+        .local-item {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 6px 10px;
+          border: 1px solid #e1e8ed;
+          border-radius: 8px;
+          font-size: 12px;
+        }
+        .badge {
+          width: 18px;
+          height: 18px;
+          border-radius: 50%;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 11px;
+          font-weight: 700;
+          flex: none;
+          background: #eff3f4;
+          color: #536471;
+        }
+        .local-item.matched {
+          border-color: #bbf7d0;
+          background: #f0fdf4;
+        }
+        .local-item.matched .badge {
+          background: #007a5a;
+          color: #ffffff;
+        }
+        .path {
+          flex: 1;
+          min-width: 0;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          color: #0f1419;
+        }
+        .footer {
+          display: flex;
+          justify-content: flex-end;
+          gap: 8px;
+          margin-top: 4px;
+        }
+      `;
+      shadow.appendChild(extraStyle);
+
+      const backdrop = document.createElement("div");
+      backdrop.className = "backdrop";
+      backdrop.innerHTML = `
+        <div class="card modal" role="dialog" aria-modal="true">
+          <div>
+            <h3 class="title">${escapeHtml(t("local_assets_title"))}</h3>
+            <p class="muted">${escapeHtml(t("local_assets_desc", { n: sources.length }))}</p>
+          </div>
+          <input id="xmp-local-dir" type="file" webkitdirectory multiple hidden>
+          <input id="xmp-local-files" type="file" multiple accept="image/*,video/*" hidden>
+          <div id="xmp-local-drop" class="drop" role="button" tabindex="0">
+            <p class="drop-title">${escapeHtml(t("local_assets_drop_title"))}</p>
+            <p class="muted">${escapeHtml(t("local_assets_drop_sub"))}</p>
+          </div>
+          <div class="sub-actions">
+            <span id="xmp-local-status" class="status">${escapeHtml(t("local_assets_matched", { matched: 0, total: sources.length }))}</span>
+            <button id="xmp-local-pick-files" class="link-btn" type="button">${escapeHtml(t("local_assets_pick_files"))}</button>
+          </div>
+          <div class="local-list">
+            ${sources
+              .map(
+                (src, idx) => `
+              <div class="local-item" data-src-idx="${idx}">
+                <span class="badge">○</span>
+                <span class="path" title="${escapeHtml(src)}">${escapeHtml(src)}</span>
+              </div>
+            `
+              )
+              .join("")}
+          </div>
+          <div class="footer">
+            <button id="xmp-local-skip" class="btn btn-ghost" type="button">${escapeHtml(t("local_assets_skip"))}</button>
+            <button id="xmp-local-continue" class="btn btn-primary" type="button" disabled>${escapeHtml(t("local_assets_continue"))}</button>
+          </div>
+        </div>
+      `;
+      shadow.appendChild(backdrop);
+
+      const dirInput = shadow.getElementById("xmp-local-dir");
+      const filesInput = shadow.getElementById("xmp-local-files");
+      const dropZone = shadow.getElementById("xmp-local-drop");
+      const statusEl = shadow.getElementById("xmp-local-status");
+      const pickFilesBtn = shadow.getElementById("xmp-local-pick-files");
+      const continueBtn = shadow.getElementById("xmp-local-continue");
+
+      let resolved = false;
+      let autoTimer = null;
+
+      const finish = (result) => {
+        if (resolved) return;
+        resolved = true;
+        if (autoTimer) {
+          clearTimeout(autoTimer);
+          autoTimer = null;
+        }
+        removeHost("local_assets_modal");
+        resolve(result);
+      };
+
+      const applyEntries = (entries) => {
+        if (!entries?.length || typeof onEntriesAdded !== "function") return;
+        const res = onEntriesAdded(entries) || {};
+        const matched = Number(res.matched) || 0;
+        const total = Number(res.total) || sources.length;
+        const matchedSet = res.matchedSet || new Set();
+
+        statusEl.textContent = t("local_assets_matched", { matched, total });
+        statusEl.className = matched > 0 && matched === total ? "status ok" : "status";
+        continueBtn.disabled = matched === 0;
+
+        sources.forEach((src, idx) => {
+          const itemEl = shadow.querySelector(`[data-src-idx="${idx}"]`);
+          if (!itemEl) return;
+          const ok = matchedSet.has(src);
+          itemEl.classList.toggle("matched", ok);
+          const badge = itemEl.querySelector(".badge");
+          if (badge) badge.textContent = ok ? "✓" : "○";
+        });
+
+        if (total > 0 && matched === total) {
+          autoTimer = setTimeout(() => finish({ skipped: false }), 350);
+        }
+      };
+
+      dropZone.addEventListener("click", () => {
+        dirInput.value = "";
+        dirInput.click();
+      });
+      dropZone.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          dirInput.value = "";
+          dirInput.click();
+        }
+      });
+      pickFilesBtn.addEventListener("click", () => {
+        filesInput.value = "";
+        filesInput.click();
+      });
+
+      dirInput.addEventListener("change", () => {
+        const list = Array.from(dirInput.files || []).map((file) => ({
+          file,
+          relPath: file.webkitRelativePath || file.name,
+        }));
+        applyEntries(list);
+      });
+
+      filesInput.addEventListener("change", () => {
+        const list = Array.from(filesInput.files || []).map((file) => ({
+          file,
+          relPath: file.webkitRelativePath || file.name,
+        }));
+        applyEntries(list);
+      });
+
+      dropZone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropZone.dataset.over = "true";
+      });
+      dropZone.addEventListener("dragleave", () => {
+        delete dropZone.dataset.over;
+      });
+      dropZone.addEventListener("drop", async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        delete dropZone.dataset.over;
+        const list = await collectFilesFromDataTransfer(e.dataTransfer);
+        applyEntries(list);
+      });
+
+      backdrop.addEventListener("click", (e) => {
+        if (e.target === backdrop) finish({ skipped: true });
+      });
+      shadow.getElementById("xmp-local-skip").addEventListener("click", () => {
+        finish({ skipped: true });
+      });
+      shadow.getElementById("xmp-local-continue").addEventListener("click", () => {
+        finish({ skipped: false });
+      });
+    });
+  }
+
   // --- Cover Picker Modal ---
   function readFileAsDataUrl(file) {
     return new Promise((resolve, reject) => {
@@ -231,7 +560,7 @@
     });
   }
 
-  function promptCoverChoice(imageSegments, resolvePreview) {
+  function promptCoverChoice(imageSegments, resolvePreview, opts = {}) {
     return new Promise((resolve) => {
       const { shadow } = createShadowHost("cover_modal");
       const extraStyle = document.createElement("style");
@@ -268,6 +597,23 @@
           background: rgba(29, 155, 240, 0.06);
         }
         .drop-title { font-weight: 600; font-size: 13px; margin: 0 0 4px; }
+        .local-bar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          padding: 8px 12px;
+          border-radius: 10px;
+          background: #fefce8;
+          border: 1px solid #fde047;
+          font-size: 12px;
+          color: #854d0e;
+        }
+        .local-bar[data-over="true"] {
+          border-color: #1d9bf0;
+          background: rgba(29, 155, 240, 0.08);
+        }
+        .local-bar span { flex: 1; }
         .choices {
           display: flex;
           flex-direction: column;
@@ -346,9 +692,14 @@
             <p class="muted">${escapeHtml(t("cover_prompt_desc"))}</p>
           </div>
           <input id="xmp-cover-file" type="file" accept="image/*" hidden>
+          <input id="xmp-cover-local-dir" type="file" webkitdirectory multiple hidden>
           <div id="xmp-cover-drop" class="drop" role="button" tabindex="0">
             <p class="drop-title">${escapeHtml(t("cover_prompt_upload"))}</p>
             <p id="xmp-cover-drop-msg" class="muted">${escapeHtml(t("cover_prompt_drop"))}</p>
+          </div>
+          <div id="xmp-cover-local-bar" class="local-bar" hidden>
+            <span>${escapeHtml(t("cover_attach_local_hint"))}</span>
+            <button id="xmp-cover-local-btn" class="btn btn-primary btn-sm" type="button">${escapeHtml(t("cover_attach_local_btn"))}</button>
           </div>
           <div class="choices">
             <label id="xmp-cover-custom-row" class="choice" hidden>
@@ -390,6 +741,9 @@
       shadow.appendChild(backdrop);
 
       const fileInput = shadow.getElementById("xmp-cover-file");
+      const localDirInput = shadow.getElementById("xmp-cover-local-dir");
+      const localBar = shadow.getElementById("xmp-cover-local-bar");
+      const localBarBtn = shadow.getElementById("xmp-cover-local-btn");
       const dropZone = shadow.getElementById("xmp-cover-drop");
       const dropMsg = shadow.getElementById("xmp-cover-drop-msg");
       const customRow = shadow.getElementById("xmp-cover-custom-row");
@@ -398,6 +752,7 @@
       const customRadio = customRow.querySelector("input");
 
       let customData = null;
+      const loadedSet = new Set();
 
       const handleLocalFile = async (file) => {
         if (!file || !file.type.startsWith("image/")) return;
@@ -412,10 +767,14 @@
         dropMsg.textContent = t("cover_prompt_custom_ready", { name: file.name || "cover" });
       };
 
-      dropZone.addEventListener("click", () => fileInput.click());
+      dropZone.addEventListener("click", () => {
+        fileInput.value = "";
+        fileInput.click();
+      });
       dropZone.addEventListener("keydown", (e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
+          fileInput.value = "";
           fileInput.click();
         }
       });
@@ -431,6 +790,7 @@
       });
       dropZone.addEventListener("drop", (e) => {
         e.preventDefault();
+        e.stopPropagation();
         delete dropZone.dataset.over;
         if (e.dataTransfer?.files?.[0]) handleLocalFile(e.dataTransfer.files[0]);
       });
@@ -456,28 +816,85 @@
         }
       });
 
-      // Load previews asynchronously
-      candidates.forEach(async (seg, idx) => {
+      const syncLocalBarVisibility = () => {
+        if (typeof opts.onAttachLocalEntries !== "function") {
+          localBar.hidden = true;
+          return;
+        }
+        const hasMissingLocal = candidates.some(
+          (seg, idx) => !loadedSet.has(idx) && !/^(?:https?:\/\/|data:)/i.test(String(seg.source || "").trim())
+        );
+        localBar.hidden = !hasMissingLocal;
+      };
+
+      const loadCandidatePreview = async (seg, idx) => {
+        if (loadedSet.has(idx)) return;
         const imgEl = shadow.querySelector(`[data-preview-idx="${idx}"]`);
         const emptyEl = shadow.querySelector(`[data-empty-idx="${idx}"]`);
         if (!imgEl) return;
         let src = /^data:image\//i.test(seg.source) ? seg.source : "";
         if (!src && typeof resolvePreview === "function") {
           const fetched = await resolvePreview(seg.source).catch(() => null);
-          if (fetched?.ok) src = `data:${fetched.mime || "image/png"};base64,${fetched.base64}`;
+          if (fetched?.ok && fetched.base64) {
+            const safeMime = /^image\//i.test(String(fetched.mime || "")) ? fetched.mime : "image/png";
+            src = `data:${safeMime};base64,${fetched.base64}`;
+          }
         }
         if (!src) {
           if (emptyEl) emptyEl.textContent = t("cover_prompt_none_img");
+          syncLocalBarVisibility();
           return;
         }
         imgEl.onload = () => {
+          loadedSet.add(idx);
           imgEl.hidden = false;
           if (emptyEl) emptyEl.hidden = true;
+          syncLocalBarVisibility();
         };
         imgEl.onerror = () => {
           if (emptyEl) emptyEl.textContent = t("cover_prompt_none_img");
+          syncLocalBarVisibility();
         };
         imgEl.src = src;
+      };
+
+      const attachEntriesInCoverModal = async (entries) => {
+        if (!entries?.length || typeof opts.onAttachLocalEntries !== "function") return;
+        opts.onAttachLocalEntries(entries);
+        await Promise.all(candidates.map((seg, idx) => loadCandidatePreview(seg, idx)));
+      };
+
+      if (typeof opts.onAttachLocalEntries === "function") {
+        localBarBtn.addEventListener("click", () => {
+          localDirInput.value = "";
+          localDirInput.click();
+        });
+        localDirInput.addEventListener("change", () => {
+          const list = Array.from(localDirInput.files || []).map((file) => ({
+            file,
+            relPath: file.webkitRelativePath || file.name,
+          }));
+          attachEntriesInCoverModal(list);
+        });
+        localBar.addEventListener("dragover", (e) => {
+          e.preventDefault();
+          localBar.dataset.over = "true";
+        });
+        localBar.addEventListener("dragleave", () => {
+          delete localBar.dataset.over;
+        });
+        localBar.addEventListener("drop", async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          delete localBar.dataset.over;
+          const list = await collectFilesFromDataTransfer(e.dataTransfer);
+          attachEntriesInCoverModal(list);
+        });
+      }
+
+      // Load previews asynchronously
+      candidates.forEach((seg, idx) => {
+        loadCandidatePreview(seg, idx);
       });
     });
   }
@@ -553,6 +970,8 @@
     hideDragHint,
     showHud,
     hideHud,
+    collectFilesFromDataTransfer,
+    promptLocalAssets,
     promptCoverChoice,
     mountImportButton,
     unmountImportButton,
