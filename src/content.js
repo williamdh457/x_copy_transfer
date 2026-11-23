@@ -128,8 +128,11 @@
     });
   }
 
-  function createLocalFileRegistry(initialEntries = []) {
+  function createLocalFileRegistry(initialEntries = [], baseDirPrefix = "") {
     const items = [];
+    const explicitMap = new Map();
+    const normBasePrefix = normalizeRelPath(baseDirPrefix);
+    const normBasePrefixLower = normBasePrefix.toLowerCase();
 
     const addEntries = (entries) => {
       for (const entry of entries || []) {
@@ -148,26 +151,389 @@
       }
     };
 
+    const bindSource = (source, file) => {
+      if (!source || !file) return;
+      explicitMap.set(source, file);
+      const normSrc = normalizeRelPath(source);
+      if (normSrc) explicitMap.set(normSrc, file);
+      addEntries([{ file, relPath: file.webkitRelativePath || file.name }]);
+    };
+
+    const resolveInItems = (list, normSrc, normSrcLower, baseSrc, baseSrcLower) =>
+      list.find((it) => it.normPath === normSrc)?.file ||
+      list.find((it) => it.normPath.endsWith("/" + normSrc))?.file ||
+      list.find((it) => it.normPathLower === normSrcLower)?.file ||
+      list.find((it) => it.normPathLower.endsWith("/" + normSrcLower))?.file ||
+      list.find((it) => it.baseName === baseSrc)?.file ||
+      list.find((it) => it.baseNameLower === baseSrcLower)?.file ||
+      null;
+
     const resolve = (source) => {
+      if (explicitMap.has(source)) return explicitMap.get(source);
       const normSrc = normalizeRelPath(source);
       if (!normSrc) return null;
+      if (explicitMap.has(normSrc)) return explicitMap.get(normSrc);
       const normSrcLower = normSrc.toLowerCase();
       const baseSrc = normSrc.split("/").pop() || normSrc;
       const baseSrcLower = baseSrc.toLowerCase();
 
-      return (
-        items.find((it) => it.normPath === normSrc)?.file ||
-        items.find((it) => it.normPath.endsWith("/" + normSrc))?.file ||
-        items.find((it) => it.normPathLower === normSrcLower)?.file ||
-        items.find((it) => it.normPathLower.endsWith("/" + normSrcLower))?.file ||
-        items.find((it) => it.baseName === baseSrc)?.file ||
-        items.find((it) => it.baseNameLower === baseSrcLower)?.file ||
-        null
-      );
+      if (normBasePrefix) {
+        const scopedExact = `${normBasePrefix}/${normSrc}`;
+        const scopedExactLower = `${normBasePrefixLower}/${normSrcLower}`;
+        const exactHit =
+          items.find((it) => it.normPath === scopedExact)?.file ||
+          items.find((it) => it.normPath.endsWith("/" + scopedExact))?.file ||
+          items.find((it) => it.normPathLower === scopedExactLower)?.file ||
+          items.find((it) => it.normPathLower.endsWith("/" + scopedExactLower))?.file;
+        if (exactHit) return exactHit;
+
+        const scopedItems = items.filter(
+          (it) =>
+            it.normPath === normBasePrefix ||
+            it.normPath.startsWith(normBasePrefix + "/") ||
+            it.normPath.includes("/" + normBasePrefix + "/") ||
+            it.normPathLower.startsWith(normBasePrefixLower + "/") ||
+            it.normPathLower.includes("/" + normBasePrefixLower + "/")
+        );
+        if (scopedItems.length) {
+          const scopedHit = resolveInItems(scopedItems, normSrc, normSrcLower, baseSrc, baseSrcLower);
+          if (scopedHit) return scopedHit;
+        }
+      }
+
+      return resolveInItems(items, normSrc, normSrcLower, baseSrc, baseSrcLower);
     };
 
     addEntries(initialEntries);
-    return { addEntries, resolve };
+    return { addEntries, bindSource, resolve };
+  }
+
+  // --- Persistent Directory Handle Store (IndexedDB) + Targeted Scanner ---
+  const HANDLE_DB_NAME = "xmp_local_dirs_v1";
+  const HANDLE_STORE = "handles";
+  const MAX_SAVED_HANDLES = 6;
+  const IGNORED_DIRS = new Set([
+    "node_modules",
+    ".git",
+    ".obsidian",
+    ".Trash",
+    "dist",
+    "build",
+    ".next",
+    "venv",
+    ".venv",
+    "__pycache__",
+    "Library",
+    "Pods",
+    "target",
+    "vendor",
+    ".cache",
+    "out",
+    "coverage",
+  ]);
+  const MAC_BUNDLE_RE = /\.(?:app|framework|xcodeproj|xcworkspace|bundle)$/i;
+
+  function isSkippableDir(name) {
+    return !name || name.startsWith(".") || IGNORED_DIRS.has(name) || MAC_BUNDLE_RE.test(name);
+  }
+
+  function openHandleDb() {
+    return new Promise((resolve, reject) => {
+      if (typeof indexedDB === "undefined") {
+        resolve(null);
+        return;
+      }
+      const req = indexedDB.open(HANDLE_DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(HANDLE_STORE)) {
+          db.createObjectStore(HANDLE_STORE, { keyPath: "id" });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function loadSavedDirHandles() {
+    try {
+      const db = await openHandleDb();
+      if (!db) return [];
+      return await new Promise((resolve) => {
+        const tx = db.transaction(HANDLE_STORE, "readonly");
+        const req = tx.objectStore(HANDLE_STORE).getAll();
+        req.onsuccess = () => {
+          const rows = Array.isArray(req.result) ? req.result : [];
+          rows.sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
+          resolve(rows.filter((r) => r?.handle && typeof r.handle.queryPermission === "function"));
+        };
+        req.onerror = () => resolve([]);
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  async function saveDirHandle(dirHandle) {
+    if (!dirHandle) return;
+    try {
+      const db = await openHandleDb();
+      if (!db) return;
+      const existing = await loadSavedDirHandles();
+      const now = Date.now();
+      let matchedId = "";
+      for (const row of existing) {
+        try {
+          if (await row.handle.isSameEntry(dirHandle)) {
+            matchedId = row.id;
+            break;
+          }
+        } catch {}
+      }
+      const id = matchedId || `${now}_${Math.random().toString(36).slice(2, 8)}`;
+      const entry = {
+        id,
+        name: dirHandle.name || "Folder",
+        handle: dirHandle,
+        lastUsed: now,
+      };
+      const toKeep = [entry, ...existing.filter((r) => r.id !== id)].slice(0, MAX_SAVED_HANDLES);
+      await new Promise((resolve) => {
+        const tx = db.transaction(HANDLE_STORE, "readwrite");
+        const store = tx.objectStore(HANDLE_STORE);
+        store.clear();
+        for (const item of toKeep) store.put(item);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      });
+    } catch {}
+  }
+
+  async function tryDirectLookup(dirHandle, relPath) {
+    const parts = normalizeRelPath(relPath).split("/").filter(Boolean);
+    if (!parts.length) return null;
+    try {
+      let cur = dirHandle;
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        cur = await cur.getDirectoryHandle(parts[i], { create: false });
+      }
+      const fh = await cur.getFileHandle(parts[parts.length - 1], { create: false });
+      return await fh.getFile();
+    } catch {
+      return null;
+    }
+  }
+
+  async function scanDirHandleForSources(dirHandle, targetSources, opts = {}) {
+    if (!dirHandle || !targetSources?.length) return [];
+
+    const out = [];
+    const unresolved = new Set(targetSources);
+
+    // If caller already knows the exact article subfolder handle, check it first
+    if (opts.preferredDirHandle) {
+      const prefEntries = await scanDirHandleForSources(opts.preferredDirHandle, [...unresolved], {
+        mdFileName: opts.mdFileName,
+      });
+      for (const entry of prefEntries) {
+        out.push(entry);
+        const normRel = normalizeRelPath(entry.relPath);
+        const normRelLower = normRel.toLowerCase();
+        const baseLower = (normRel.split("/").pop() || "").toLowerCase();
+        for (const src of [...unresolved]) {
+          const ns = normalizeRelPath(src).toLowerCase();
+          const bs = (ns.split("/").pop() || "");
+          if (normRelLower === ns || normRelLower.endsWith("/" + ns) || baseLower === bs) {
+            unresolved.delete(src);
+          }
+        }
+      }
+      if (unresolved.size === 0) return out;
+    }
+
+    const targets = [...unresolved].map((src) => {
+      const normPath = normalizeRelPath(src);
+      const baseName = normPath.split("/").pop() || normPath;
+      return {
+        src,
+        normPath,
+        normPathLower: normPath.toLowerCase(),
+        baseName,
+        baseNameLower: baseName.toLowerCase(),
+      };
+    });
+
+    // Fast path: direct relative path lookup from root handle
+    for (const tInfo of targets) {
+      if (!unresolved.has(tInfo.src)) continue;
+      const file = await tryDirectLookup(dirHandle, tInfo.normPath);
+      if (file) {
+        out.push({ file, relPath: tInfo.normPath });
+        unresolved.delete(tInfo.src);
+      }
+    }
+    if (unresolved.size === 0) return out;
+
+    // Fallback BFS scan: collect candidates across subfolders and score each subfolder (dirKey)
+    // so sibling folders with identical filenames (e.g. images/00_主页封面图.png) don't collide.
+    const mdNameLower = String(opts.mdFileName || "").trim().toLowerCase();
+    const mdMatchedDirs = new Set();
+    const candidates = [];
+
+    const deriveDirKey = (relPath, tInfo) => {
+      const norm = normalizeRelPath(relPath);
+      const normLower = norm.toLowerCase();
+      if (normLower === tInfo.normPathLower) return "";
+      if (normLower.endsWith("/" + tInfo.normPathLower)) {
+        return norm.slice(0, norm.length - tInfo.normPath.length - 1);
+      }
+      const parts = norm.split("/");
+      parts.pop();
+      return parts.join("/");
+    };
+
+    const queue = [{ handle: dirHandle, prefix: "", depth: 0 }];
+    let scannedDirs = 0;
+    let scannedEntries = 0;
+    const t0 = performance.now();
+    const MAX_DIRS = 300;
+    const MAX_ENTRIES = 3000;
+    const MAX_MS = 2500;
+
+    while (
+      queue.length &&
+      scannedDirs < MAX_DIRS &&
+      scannedEntries < MAX_ENTRIES &&
+      performance.now() - t0 < MAX_MS
+    ) {
+      const { handle, prefix, depth } = queue.shift();
+      scannedDirs += 1;
+      try {
+        for await (const [name, child] of handle.entries()) {
+          scannedEntries += 1;
+          if (scannedEntries >= MAX_ENTRIES || performance.now() - t0 >= MAX_MS) {
+            break;
+          }
+          const relPath = prefix ? `${prefix}/${name}` : name;
+          if (child.kind === "file") {
+            if (mdNameLower && name.toLowerCase() === mdNameLower) {
+              mdMatchedDirs.add(prefix);
+            }
+            const norm = normalizeRelPath(relPath);
+            const normLower = norm.toLowerCase();
+            const base = norm.split("/").pop() || norm;
+            const baseLower = base.toLowerCase();
+            for (const tInfo of targets) {
+              if (!unresolved.has(tInfo.src)) continue;
+              const hit =
+                norm === tInfo.normPath ||
+                norm.endsWith("/" + tInfo.normPath) ||
+                normLower === tInfo.normPathLower ||
+                normLower.endsWith("/" + tInfo.normPathLower) ||
+                base === tInfo.baseName ||
+                baseLower === tInfo.baseNameLower;
+              if (hit) {
+                candidates.push({
+                  relPath,
+                  dirKey: deriveDirKey(relPath, tInfo),
+                  targetSrc: tInfo.src,
+                  fileHandle: child,
+                });
+              }
+            }
+          } else if (child.kind === "directory" && depth < 5 && !isSkippableDir(name)) {
+            queue.push({ handle: child, prefix: relPath, depth: depth + 1 });
+          }
+        }
+      } catch {}
+    }
+
+    if (!candidates.length) return out;
+
+    const dirTargetsMap = new Map();
+    for (const c of candidates) {
+      if (!dirTargetsMap.has(c.dirKey)) dirTargetsMap.set(c.dirKey, new Set());
+      dirTargetsMap.get(c.dirKey).add(c.targetSrc);
+    }
+
+    const dirScores = [...dirTargetsMap.entries()].map(([dirKey, set]) => ({
+      dirKey,
+      score: set.size * 100 + (mdMatchedDirs.has(dirKey) ? 50 : 0),
+    }));
+    dirScores.sort((a, b) => b.score - a.score);
+
+    const pickedByTarget = new Map();
+    for (const { dirKey } of dirScores) {
+      for (const c of candidates) {
+        if (c.dirKey === dirKey && !pickedByTarget.has(c.targetSrc)) {
+          pickedByTarget.set(c.targetSrc, c);
+        }
+      }
+      if (pickedByTarget.size >= unresolved.size) break;
+    }
+
+    for (const c of pickedByTarget.values()) {
+      try {
+        const file = await c.fileHandle.getFile();
+        out.push({ file, relPath: c.relPath });
+      } catch {}
+    }
+    return out;
+  }
+
+  async function importFromDirectoryHandle(dirHandle) {
+    if (!dirHandle) return { ok: false, error: "no directory" };
+    await saveDirHandle(dirHandle);
+    const mdCandidates = [];
+    const queue = [{ handle: dirHandle, prefix: "", depth: 0 }];
+    let scannedEntries = 0;
+    const t0 = performance.now();
+
+    while (queue.length && scannedEntries < 1000 && performance.now() - t0 < 2000) {
+      const { handle, prefix, depth } = queue.shift();
+      try {
+        for await (const [name, child] of handle.entries()) {
+          scannedEntries += 1;
+          if (scannedEntries >= 1000 || performance.now() - t0 >= 2000) break;
+          const relPath = prefix ? `${prefix}/${name}` : name;
+          if (child.kind === "file" && /\.(md|markdown|mdown|mkd)$/i.test(name)) {
+            mdCandidates.push({
+              child,
+              parentHandle: handle,
+              name,
+              relPath,
+              dirPrefix: prefix,
+              depth,
+            });
+          } else if (child.kind === "directory" && depth < 3 && !isSkippableDir(name)) {
+            queue.push({ handle: child, prefix: relPath, depth: depth + 1 });
+          }
+        }
+      } catch {}
+    }
+
+    if (!mdCandidates.length) {
+      UI().showHud(t("no_md_in_folder"), "warn", { autoHideMs: 3000 });
+      return { ok: false, error: "no markdown file found" };
+    }
+    mdCandidates.sort((a, b) => a.dirPrefix.localeCompare(b.dirPrefix) || a.name.localeCompare(b.name));
+
+    let chosen = mdCandidates[0];
+    if (mdCandidates.length > 1) {
+      const idx = await UI().promptMarkdownChoice(mdCandidates);
+      if (idx === null || !mdCandidates[idx]) {
+        return { ok: false, cancelled: true };
+      }
+      chosen = mdCandidates[idx];
+    }
+
+    const mdFile = await chosen.child.getFile();
+    const text = await mdFile.text();
+    return importMarkdownText(text, [], {
+      preferredDirHandle: chosen.parentHandle,
+      baseDirPrefix: chosen.dirPrefix,
+      mdFileName: chosen.name,
+    });
   }
 
   async function fetchMedia(source, kind, localRegistry, previewCache, inflightMap) {
@@ -198,9 +564,23 @@
     }
   }
 
+  const EDITOR_SELECTOR =
+    ".public-DraftEditor-content, [contenteditable='true'][role='textbox'], [data-contents='true'] [contenteditable='true']";
+
   function findEditorDom() {
-    const el = document.querySelector(".public-DraftEditor-content");
-    return el && el.getBoundingClientRect().width > 200 ? el : null;
+    let best = null;
+    let bestArea = 0;
+    for (const el of document.querySelectorAll(EDITOR_SELECTOR)) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 200 && rect.height > 40) {
+        const area = rect.width * rect.height;
+        if (area > bestArea) {
+          best = el;
+          bestArea = area;
+        }
+      }
+    }
+    return best;
   }
 
   async function ensureEditorOpen() {
@@ -210,13 +590,15 @@
     // On /compose/articles list page, try clicking Create / Write button
     if (!EDIT_URL_RE.test(location.href)) {
       UI().showHud(t("opening_editor"), "work");
-      const labels = ["create", "write", "new article", "创建", "撰写", "新建文章", "写文章"];
+      const labels = new Set(["create", "write", "new article", "创建", "撰写", "新建文章", "写文章"]);
       const findCreateBtn = () => {
         for (const el of document.querySelectorAll("button, a[role='button'], [role='button']")) {
-          const text = (el.textContent || el.getAttribute("aria-label") || "").toLowerCase().trim();
-          if (text && labels.some((l) => text === l || text.includes(l))) {
-            const rect = el.getBoundingClientRect();
-            if (rect.width > 20 && rect.height > 20) return el;
+          const rect = el.getBoundingClientRect();
+          if (rect.width <= 20 || rect.width >= 280 || rect.height <= 20 || rect.height >= 80) continue;
+          const text = (el.textContent || "").toLowerCase().trim();
+          const aria = (el.getAttribute("aria-label") || "").toLowerCase().trim();
+          if (labels.has(text) || labels.has(aria)) {
+            return el;
           }
         }
         return null;
@@ -306,7 +688,7 @@
     });
   }
 
-  async function importMarkdownText(rawMarkdown, initialEntries = []) {
+  async function importMarkdownText(rawMarkdown, initialEntries = [], opts = {}) {
     if (isBusy) return { ok: false, error: "busy" };
     isBusy = true;
     activeAbort = new AbortController();
@@ -350,7 +732,7 @@
       const droppedCount = Math.max(0, mediaCount - MD().MAX_BODY_IMAGES);
 
       // Resolve any local relative image/video paths before cover selection and upload
-      const localRegistry = createLocalFileRegistry(initialEntries);
+      const localRegistry = createLocalFileRegistry(initialEntries, opts?.baseDirPrefix || "");
       const localSourceSet = new Set();
       for (const seg of segments) {
         if ((seg.type === "image" || seg.type === "video") && seg.source && !isRemoteOrDataUrl(seg.source)) {
@@ -360,13 +742,100 @@
       if (parsed.coverFromFrontmatter && parsed.cover && !isRemoteOrDataUrl(parsed.cover)) {
         localSourceSet.add(parsed.cover);
       }
-      const missingLocal = [...localSourceSet].filter((src) => !localRegistry.resolve(src));
+      let missingLocal = [...localSourceSet].filter((src) => !localRegistry.resolve(src));
+      const reconnectableHandles = [];
+
+      if (missingLocal.length > 0 && opts?.preferredDirHandle) {
+        const entries = await scanDirHandleForSources(opts.preferredDirHandle, missingLocal, {
+          mdFileName: opts?.mdFileName || "",
+        });
+        if (entries.length) {
+          localRegistry.addEntries(entries);
+          missingLocal = missingLocal.filter((src) => !localRegistry.resolve(src));
+        }
+      }
+
+      if (missingLocal.length > 0) {
+        const savedHandles = await loadSavedDirHandles();
+        for (const item of savedHandles) {
+          if (!missingLocal.length) break;
+          let perm = "denied";
+          try {
+            perm = await item.handle.queryPermission({ mode: "read" });
+          } catch {}
+          if (perm === "granted") {
+            const entries = await scanDirHandleForSources(item.handle, missingLocal, {
+              mdFileName: opts?.mdFileName || "",
+            });
+            if (entries.length) {
+              localRegistry.addEntries(entries);
+              missingLocal = missingLocal.filter((src) => !localRegistry.resolve(src));
+            }
+          } else if (perm === "prompt") {
+            reconnectableHandles.push(item);
+          }
+        }
+      }
+
       if (missingLocal.length > 0) {
         setHud(t("preparing"), "work");
-        await UI().promptLocalAssets(missingLocal, (entries) => {
-          localRegistry.addEntries(entries);
-          const matchedSet = new Set(missingLocal.filter((s) => Boolean(localRegistry.resolve(s))));
-          return { matched: matchedSet.size, total: missingLocal.length, matchedSet };
+        const buildLocalMatchState = () => {
+          const matchedSet = new Set();
+          const matchedFiles = new Map();
+          for (const src of missingLocal) {
+            const file = localRegistry.resolve(src);
+            if (file) {
+              matchedSet.add(src);
+              matchedFiles.set(src, file);
+            }
+          }
+          return { matched: matchedSet.size, total: missingLocal.length, matchedSet, matchedFiles };
+        };
+
+        const scanAndApplyHandle = async (dirHandle) => {
+          const unresolved = missingLocal.filter((src) => !localRegistry.resolve(src));
+          const entries = await scanDirHandleForSources(dirHandle, unresolved, {
+            mdFileName: opts?.mdFileName || "",
+          });
+          if (entries.length) localRegistry.addEntries(entries);
+          return { ...buildLocalMatchState(), scannedCount: entries.length };
+        };
+
+        await UI().promptLocalAssets(missingLocal, {
+          reconnectableHandles,
+          onReconnectHandle: async (item) => {
+            try {
+              const perm = await item.handle.requestPermission({ mode: "read" });
+              if (perm !== "granted") return { denied: true, ...buildLocalMatchState() };
+              await saveDirHandle(item.handle);
+              return await scanAndApplyHandle(item.handle);
+            } catch {
+              return { denied: true, ...buildLocalMatchState() };
+            }
+          },
+          onAuthorizeFolder: async () => {
+            if (typeof window.showDirectoryPicker !== "function") {
+              return { fallbackPicker: true };
+            }
+            try {
+              const dirHandle = await window.showDirectoryPicker({ mode: "read" });
+              await saveDirHandle(dirHandle);
+              return await scanAndApplyHandle(dirHandle);
+            } catch (err) {
+              if (err?.name === "AbortError") return { cancelled: true };
+              if (err?.name === "SecurityError") return { securityError: true };
+              return { fallbackPicker: true };
+            }
+          },
+          onEntriesAdded: (entries) => {
+            localRegistry.addEntries(entries);
+            return buildLocalMatchState();
+          },
+          onDirHandlesDropped: async (dirHandles) => {
+            for (const dh of dirHandles || []) {
+              await saveDirHandle(dh);
+            }
+          },
         });
         if (signal.aborted) throw new DOMException("Upload stopped", "AbortError");
       }
@@ -587,7 +1056,39 @@
   async function importMarkdownFile(file) {
     if (!file) return;
     const text = await file.text();
-    return importMarkdownText(text);
+    return importMarkdownText(text, [], { mdFileName: file.name || "" });
+  }
+
+  async function importEntriesWithPicker(entries, dirHandles = []) {
+    for (const dh of dirHandles || []) {
+      await saveDirHandle(dh);
+    }
+    const mdEntries = (entries || []).filter((item) => isMarkdownFile(item.file));
+    if (!mdEntries.length) {
+      UI().showHud(t("no_md_in_folder"), "warn", { autoHideMs: 3000 });
+      return { ok: false, error: "no markdown file found" };
+    }
+    const mapped = mdEntries.map((item) => {
+      const norm = normalizeRelPath(item.relPath || item.file?.name || "");
+      const parts = norm.split("/");
+      const name = parts.pop() || item.file?.name || "article.md";
+      const dirPrefix = parts.join("/");
+      return { item, name, relPath: norm, dirPrefix };
+    });
+    mapped.sort((a, b) => a.dirPrefix.localeCompare(b.dirPrefix) || a.name.localeCompare(b.name));
+
+    let chosen = mapped[0];
+    if (mapped.length > 1) {
+      const idx = await UI().promptMarkdownChoice(mapped);
+      if (idx === null || !mapped[idx]) return { ok: false, cancelled: true };
+      chosen = mapped[idx];
+    }
+
+    const text = await chosen.item.file.text();
+    return importMarkdownText(text, entries, {
+      baseDirPrefix: chosen.dirPrefix,
+      mdFileName: chosen.name,
+    });
   }
 
   // --- Drag & Drop Handlers ---
@@ -654,12 +1155,11 @@
       e.preventDefault();
       e.stopPropagation();
 
+      const handlePromises = UI().captureDirHandlesFromDataTransfer(dt);
       const entries = await UI().collectFilesFromDataTransfer(dt, capturedEntries);
-      const mdEntries = entries.filter((item) => isMarkdownFile(item.file));
-      if (!mdEntries.length) return;
-      mdEntries.sort((a, b) => a.relPath.split("/").length - b.relPath.split("/").length);
-      const text = await mdEntries[0].file.text();
-      await importMarkdownText(text, entries);
+      const handles = await Promise.all(handlePromises);
+      const dirHandles = handles.filter((h) => h && h.kind === "directory");
+      await importEntriesWithPicker(entries, dirHandles);
     },
     true
   );
@@ -674,7 +1174,7 @@
     "paste",
     async (e) => {
       if (!ARTICLES_URL_RE.test(location.href) || isBusy) return;
-      const editorEl = e.target?.closest?.(".public-DraftEditor-content");
+      const editorEl = e.target?.closest?.(".public-DraftEditor-content, [contenteditable='true'][role='textbox']");
       if (!editorEl || editorEl.getBoundingClientRect().width < 200) return;
       const plain = e.clipboardData?.getData("text/plain") || "";
       if (!MD().isMarkdown(plain)) return;
@@ -688,7 +1188,7 @@
   // --- Floating Button Lifecycle (SPA route tracking) ---
   function syncButtonVisibility() {
     if (ARTICLES_URL_RE.test(location.href)) {
-      UI().mountImportButton((file) => importMarkdownFile(file));
+      UI().mountImportButton(() => openQuickImportDialog());
     } else {
       UI().unmountImportButton();
     }
@@ -696,6 +1196,47 @@
 
   syncButtonVisibility();
   setInterval(syncButtonVisibility, 1200);
+
+  I18N()?.onLangChange?.(() => {
+    UI().unmountImportButton();
+    syncButtonVisibility();
+  });
+
+  async function openQuickImportDialog() {
+    if (isBusy) return;
+    const savedHandles = await loadSavedDirHandles();
+    UI().promptQuickImport({
+      savedHandles,
+      onOpenSavedHandle: async (item) => {
+        if (!item?.handle) return;
+        try {
+          let perm = await item.handle.queryPermission({ mode: "read" });
+          if (perm !== "granted") {
+            perm = await item.handle.requestPermission({ mode: "read" });
+          }
+          if (perm === "granted") {
+            await importFromDirectoryHandle(item.handle);
+          }
+        } catch {}
+      },
+      onPickMdFile: (file) => importMarkdownFile(file),
+      onPickFolder: async () => {
+        if (typeof window.showDirectoryPicker === "function") {
+          try {
+            const dirHandle = await window.showDirectoryPicker({ mode: "read" });
+            await importFromDirectoryHandle(dirHandle);
+            return;
+          } catch (err) {
+            if (err?.name === "AbortError") return;
+          }
+        }
+        return { fallbackPicker: true };
+      },
+      onDropEntries: async (entries, dirHandles) => {
+        await importEntriesWithPicker(entries, dirHandles);
+      },
+    });
+  }
 
   // --- Popup Message Bridge ---
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -707,11 +1248,19 @@
       });
       return false;
     }
+    if (msg?.type === "openImportModal") {
+      sendResponse({ ok: true });
+      openQuickImportDialog();
+      return false;
+    }
     if (msg?.type === "importMarkdownText" && typeof msg.text === "string") {
-      importMarkdownText(msg.text)
-        .then(sendResponse)
-        .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
-      return true;
+      sendResponse({ ok: true, started: true });
+      importMarkdownText(msg.text).catch((err) => {
+        UI().showHud(t("failed", { msg: String(err?.message || err).slice(0, 160) }), "warn", {
+          dismissible: true,
+        });
+      });
+      return false;
     }
     return false;
   });

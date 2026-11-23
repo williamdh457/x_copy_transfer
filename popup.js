@@ -43,7 +43,7 @@
     },
   };
 
-  let lang = /^zh/i.test(navigator.language || "") ? "zh" : "en";
+  let lang = "zh";
   let activeTabId = null;
 
   function renderTexts() {
@@ -136,13 +136,10 @@
       window.close();
     });
 
-    const fileInput = document.getElementById("md-file-input");
-    document.getElementById("quick-import-btn").addEventListener("click", () => fileInput.click());
-    fileInput.addEventListener("change", async () => {
-      const file = fileInput.files?.[0];
-      if (!file || !activeTabId) return;
-      const text = await file.text();
-      chrome.tabs.sendMessage(activeTabId, { type: "importMarkdownText", text }, () => {
+    document.getElementById("quick-import-btn").addEventListener("click", () => {
+      if (!activeTabId) return;
+      chrome.tabs.sendMessage(activeTabId, { type: "openImportModal" }, () => {
+        void chrome.runtime.lastError;
         window.close();
       });
     });

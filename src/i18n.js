@@ -33,13 +33,24 @@
       img_err_fetch_failed: "图片拉取失败",
       img_err_local_unmatched: "未关联本地文件",
       local_assets_title: "关联本地图片",
-      local_assets_desc: "检测到 {n} 张本地路径图片，请选择文章所在文件夹（或图片文件夹）以显示预览并自动上传。",
-      local_assets_drop_title: "点击选择文件夹，或将文件夹 / 图片拖入此处",
-      local_assets_drop_sub: "选择包含 images/ 的文章目录即可自动匹配",
-      local_assets_pick_files: "或选择多张图片文件",
+      local_assets_desc: "检测到 {n} 张本地路径图片，授权文章或图片文件夹（只需一次，后续自动记住并预览），或直接拖入文件夹。",
+      local_assets_drop_title: "授权文章 / 图片文件夹（或将文件夹拖入此处）",
+      local_assets_drop_sub: "授权一次后将自动记住，以后导入直接显示缩略图预览",
+      local_assets_reconnect: "一键恢复已授权目录：{name}",
+      local_assets_scanning: "正在扫描文件夹...",
+      local_assets_security_hint: "浏览器限制直接授权系统根目录（如桌面），请进入桌面后选择具体的文章文件夹或 images 文件夹。",
       local_assets_matched: "已匹配 {matched}/{total} 张本地图片",
+      local_assets_no_match_hint: "已扫描 {count} 个文件，未匹配到上述路径。请确认选择的是包含这些图片的文章目录或 images 文件夹。",
       local_assets_skip: "跳过本地图片",
       local_assets_continue: "继续导入",
+      quick_import_title: "导入 Markdown 到 X 文章",
+      quick_import_desc: "选择单个 .md 文件，或直接选择包含 .md 和 images/ 的整个文章文件夹（推荐，自动带图预览）。",
+      quick_import_pick_folder: "选择文章文件夹（含图片）",
+      quick_import_pick_md: "选择单个 .md 文件",
+      quick_import_saved_folder: "从已授权目录选文章：{name}",
+      md_picker_title: "选择要导入的 Markdown 文章",
+      md_picker_desc: "检测到 {n} 篇 Markdown 文件，点击选择你要导入的那一篇（将自动关联对应目录的图片）：",
+      no_md_in_folder: "该文件夹中未找到 .md 文件",
       cover_prompt_title: "选择文章封面图",
       cover_prompt_desc: "在正文前添加一张封面图，或留空跳过。",
       cover_prompt_upload: "点击或拖入本地图片作为封面",
@@ -89,13 +100,24 @@
       img_err_fetch_failed: "Failed to fetch image",
       img_err_local_unmatched: "Local file not attached",
       local_assets_title: "Attach Local Images",
-      local_assets_desc: "Found {n} local image path(s). Select the article or images folder to preview and upload them.",
-      local_assets_drop_title: "Click to choose a folder, or drop folder / images here",
-      local_assets_drop_sub: "Pick the folder containing your images to auto-match",
-      local_assets_pick_files: "Or select individual image files",
+      local_assets_desc: "Found {n} local image path(s). Authorize the article or images folder once (remembered for future imports), or drop the folder here.",
+      local_assets_drop_title: "Authorize article / images folder (or drop folder here)",
+      local_assets_drop_sub: "Remembered after first grant — future imports auto-preview without asking",
+      local_assets_reconnect: "Reconnect saved folder: {name}",
+      local_assets_scanning: "Scanning folder...",
+      local_assets_security_hint: "Chrome blocks authorizing system root folders (like Desktop). Please open it and pick your specific article or images/ folder.",
       local_assets_matched: "Matched {matched}/{total} local image(s)",
+      local_assets_no_match_hint: "Scanned {count} file(s), none matched the paths above. Make sure you picked the article folder or images/ folder.",
       local_assets_skip: "Skip Local Images",
       local_assets_continue: "Continue Import",
+      quick_import_title: "Import Markdown to X Article",
+      quick_import_desc: "Pick a .md file, or select the entire article folder containing .md and images/ (recommended for instant image previews).",
+      quick_import_pick_folder: "Choose Article Folder (with images)",
+      quick_import_pick_md: "Choose Single .md File",
+      quick_import_saved_folder: "Open saved folder: {name}",
+      md_picker_title: "Choose Markdown Article to Import",
+      md_picker_desc: "Found {n} Markdown files. Click one to import (images from its folder will auto-match):",
+      no_md_in_folder: "No .md files found in this folder",
       cover_prompt_title: "Choose Article Cover Image",
       cover_prompt_desc: "Pick a cover image for this article, or skip.",
       cover_prompt_upload: "Click or drop a local image as cover",
@@ -116,17 +138,38 @@
     },
   };
 
-  let currentLang = /^zh/i.test(navigator.language || "") ? "zh" : "en";
+  let currentLang = "zh";
+  const langListeners = new Set();
+
+  function notifyLangChange() {
+    for (const cb of langListeners) {
+      try {
+        cb(currentLang);
+      } catch {}
+    }
+  }
 
   async function loadLang() {
     try {
       const res = await chrome.storage.local.get(LANG_KEY);
       if (res?.[LANG_KEY] === "zh" || res?.[LANG_KEY] === "en") {
         currentLang = res[LANG_KEY];
+        notifyLangChange();
       }
     } catch {}
     return currentLang;
   }
+
+  try {
+    chrome.storage?.onChanged?.addListener((changes, area) => {
+      if (area !== "local" || !changes?.[LANG_KEY]) return;
+      const next = changes[LANG_KEY].newValue;
+      if ((next === "zh" || next === "en") && next !== currentLang) {
+        currentLang = next;
+        notifyLangChange();
+      }
+    });
+  } catch {}
 
   function t(key, vars) {
     const dict = MESSAGES[currentLang] || MESSAGES.zh;
@@ -144,10 +187,19 @@
   }
 
   function setLang(lang) {
-    if (lang === "zh" || lang === "en") currentLang = lang;
+    if (lang === "zh" || lang === "en") {
+      currentLang = lang;
+      notifyLangChange();
+    }
+  }
+
+  function onLangChange(cb) {
+    if (typeof cb !== "function") return () => {};
+    langListeners.add(cb);
+    return () => langListeners.delete(cb);
   }
 
   loadLang();
 
-  window.__XMP_I18N__ = { t, loadLang, getLang, setLang, MESSAGES };
+  window.__XMP_I18N__ = { t, loadLang, getLang, setLang, onLangChange, MESSAGES };
 })();
